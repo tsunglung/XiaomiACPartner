@@ -1,7 +1,10 @@
 climate_learn_command:
+  name: climate learn command
   description: 'Learn an IR command, press "Call Service", point the remote at the IR device, and the learned command will be shown as a notification in Overview.'
   fields:
     entity_id:
+      integration: xiaomi_miio_airconditioningcompanion
+      domain: climate
       description: "Name of the entity to learn command from."
       example: "xiaomi_miio_airconditioningcompanion.xiaomi_miio_device"
     slot:
@@ -12,9 +15,12 @@ climate_learn_command:
       example: "30"
 
 climate_send_command:
+  name: climate send command
   description: 'Send captured infrared command or device configuration.'
   fields:
     entity_id:
+      integration: xiaomi_miio_airconditioningcompanion
+      domain: climate
       description: "Name of the acpartner entity."
       example: "xiaomi_miio_airconditioningcompanion.xiaomi_miio_device"
     command:

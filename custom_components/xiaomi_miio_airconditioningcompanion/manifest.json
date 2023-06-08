@@ -2,16 +2,17 @@
   "domain": "xiaomi_miio_airconditioningcompanion",
   "name": "Xiaomi Mi and Aqara Air Conditioning Companion",
   "codeowners": [
-    "@syssi"
+    "@syssi",
+    "@tsunglung"
   ],
-  "config_flow": false,
-  "dependencies": ["sensor"],
-  "documentation": "https://github.com/syssi/xiaomi_airconditioningcompanion",
+  "config_flow": true,
+  "dependencies": ["climate"],
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/syssi/xiaomi_airconditioningcompanion/issues",
+  "documentation": "https://github.com/tsunglung/XiaomiACPartner",
+  "issue_tracker": "https://github.com/tsunglung/XiaomiACPartner/issues",
   "requirements": [
-    "construct==2.10.56",
+    "construct>=2.10.56",
     "python-miio>=0.5.12"
   ],
-  "version": "2023.6.0.2"
+  "version": "2023.6.0.4"
 }

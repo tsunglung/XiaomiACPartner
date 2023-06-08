@@ -1,8 +1,5 @@
 """
-Support for Xiaomi Mi Home Air Conditioner Companion (AC Partner)
-
-For more details about this platform, please refer to the documentation
-https://home-assistant.io/components/climate.xiaomi_miio
+Support for Xiaomi Air Conditioner Companion (AC Partner)
 """
 import asyncio
 import enum
@@ -10,10 +7,17 @@ import logging
 import time
 from datetime import timedelta
 from functools import partial
+import voluptuous as vol
 
 import homeassistant.helpers.config_validation as cv
-import voluptuous as vol
-from homeassistant.components.climate import PLATFORM_SCHEMA, ClimateEntity
+from homeassistant import config_entries
+from homeassistant.core import callback, HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers.event import async_track_state_change
+from homeassistant.helpers.restore_state import RestoreEntity
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util.dt import utcnow
+from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
     ATTR_HVAC_MODE,
     HVAC_MODE_AUTO,
@@ -24,7 +28,7 @@ from homeassistant.components.climate.const import (
     HVAC_MODE_OFF,
     SUPPORT_FAN_MODE,
     SUPPORT_SWING_MODE,
-    SUPPORT_TARGET_TEMPERATURE,
+    SUPPORT_TARGET_TEMPERATURE
 )
 from homeassistant.components.remote import (
     ATTR_DELAY_SECS,
@@ -35,64 +39,61 @@ from homeassistant.components.remote import (
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_TEMPERATURE,
-    ATTR_UNIT_OF_MEASUREMENT,
     CONF_HOST,
-    CONF_NAME,
+    CONF_MAC,
     CONF_TIMEOUT,
-    CONF_TOKEN,
     STATE_ON,
-    TEMP_CELSIUS,
+    STATE_OFF,
+    STATE_UNKNOWN,
+    STATE_UNAVAILABLE,
+    PRECISION_WHOLE
 )
-from homeassistant.core import callback
-from homeassistant.exceptions import PlatformNotReady
-from homeassistant.helpers.event import async_track_state_change
-from homeassistant.util.dt import utcnow
 
-_LOGGER = logging.getLogger(__name__)
-
-SUCCESS = ["ok"]
-
-DEFAULT_NAME = "Xiaomi AC Companion"
-DATA_KEY = "climate.xiaomi_miio_airconditioningcompanion"
-DOMAIN = "xiaomi_miio_airconditioningcompanion"
-TARGET_TEMPERATURE_STEP = 1
-
-DEFAULT_TIMEOUT = 10
-DEFAULT_SLOT = 30
-
-ATTR_AIR_CONDITION_MODEL = "ac_model"
-ATTR_SWING_MODE = "swing_mode"
-ATTR_FAN_MODE = "fan_mode"
-ATTR_LOAD_POWER = "load_power"
-ATTR_LED = "led"
-
-SUPPORT_FLAGS = SUPPORT_TARGET_TEMPERATURE | SUPPORT_FAN_MODE | SUPPORT_SWING_MODE
-
-CONF_SENSOR = "target_sensor"
-CONF_MIN_TEMP = "min_temp"
-CONF_MAX_TEMP = "max_temp"
-CONF_SLOT = "slot"
-CONF_COMMAND = "command"
-CONF_POWER_SENSOR = "power_sensor"
-
-SCAN_INTERVAL = timedelta(seconds=15)
-
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Required(CONF_TOKEN): vol.All(cv.string, vol.Length(min=32, max=32)),
-        vol.Required(CONF_SENSOR): cv.entity_id,
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_MIN_TEMP, default=16): vol.Coerce(int),
-        vol.Optional(CONF_MAX_TEMP, default=30): vol.Coerce(int),
-        vol.Optional(CONF_POWER_SENSOR): cv.entity_id,
-    }
+from miio import DeviceException
+from miio.airconditioningcompanion import (
+    FanSpeed,
+    Led,
+    Power,
+    SwingMode
 )
+from miio.airconditioningcompanion import OperationMode as MiioOperationMode
+
+from .const import (
+    ATTR_AIR_CONDITION_MODEL,
+    ATTR_SWING_MODE,
+    ATTR_FAN_MODE,
+    ATTR_LOAD_POWER,
+    ATTR_LED,
+    CONF_COMMAND,
+    CONF_MODEL,
+    CONF_HUMIDITY_SENSOR,
+    CONF_TEMPERATURE_SENSOR,
+    CONF_POWER_SENSOR,
+    CONF_MAX_TEMP,
+    CONF_MIN_TEMP,
+    CONF_SLOT,
+    DATA_KEY,
+    DEFAULT_DELAY,
+    DEFAULT_TARGET_TEMPERATURE,
+    DEFAULT_TIMEOUT,
+    DEFAULT_SLOT,
+    DOMAIN,
+    MODELS_MIIO,
+    TARGET_TEMPERATURE_STEP,
+    ACPARTNER_PROPS
+)
+
+SUPPORT_FLAGS = (
+    SUPPORT_TARGET_TEMPERATURE |
+    SUPPORT_FAN_MODE |
+    SUPPORT_SWING_MODE
+)
+
 
 SERVICE_LEARN_COMMAND = "climate_learn_command"
 SERVICE_SEND_COMMAND = "climate_send_command"
 
-SERVICE_SCHEMA = vol.Schema({vol.Optional(ATTR_ENTITY_ID): cv.entity_ids})
+SERVICE_SCHEMA = vol.Schema({vol.Required(ATTR_ENTITY_ID): cv.entity_ids})
 
 SERVICE_SCHEMA_LEARN_COMMAND = SERVICE_SCHEMA.extend(
     {
@@ -107,7 +108,7 @@ SERVICE_SCHEMA_LEARN_COMMAND = SERVICE_SCHEMA.extend(
 
 SERVICE_SCHEMA_SEND_COMMAND = SERVICE_SCHEMA.extend(
     {
-        vol.Optional(CONF_COMMAND): cv.string,
+        vol.Required(CONF_COMMAND, default=""): cv.string,
         vol.Optional(ATTR_NUM_REPEATS, default=DEFAULT_NUM_REPEATS): cv.positive_int,
         vol.Optional(ATTR_DELAY_SECS, default=DEFAULT_DELAY_SECS): vol.Coerce(float),
     }
@@ -124,52 +125,44 @@ SERVICE_TO_METHOD = {
     },
 }
 
+_LOGGER = logging.getLogger(__name__)
 
-# pylint: disable=unused-argument
-async def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
-    """Set up the air conditioning companion from config."""
-    from miio import AirConditioningCompanion, DeviceException
+class OperationMode(enum.Enum):
+    Heat = HVAC_MODE_HEAT
+    Cool = HVAC_MODE_COOL
+    Auto = HVAC_MODE_AUTO
+    Dehumidify = HVAC_MODE_DRY
+    Ventilate = HVAC_MODE_FAN_ONLY
+    Off = HVAC_MODE_OFF
 
-    if DATA_KEY not in hass.data:
-        hass.data[DATA_KEY] = {}
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: config_entries.ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up the Xiaomi Air Conditioning Companion platform."""
 
-    host = config.get(CONF_HOST)
-    name = config.get(CONF_NAME)
-    token = config.get(CONF_TOKEN)
-    min_temp = config.get(CONF_MIN_TEMP)
-    max_temp = config.get(CONF_MAX_TEMP)
-    sensor_entity_id = config.get(CONF_SENSOR)
-    power_sensor_entity_id = config.get(CONF_POWER_SENSOR)
+    host = entry.options[CONF_HOST]
+    model = entry.options[CONF_MODEL]
+    name = entry.title
+    unique_id = entry.unique_id
 
-    _LOGGER.info("Initializing with host %s (token %s...)", host, token[:5])
+    acpartner = hass.data[DOMAIN][host]
 
     try:
-        device = AirConditioningCompanion(host, token)
-        device_info = device.info()
-        model = device_info.model
-        unique_id = "{}-{}".format(model, device_info.mac_address)
-        _LOGGER.info(
-            "%s %s %s detected",
-            model,
-            device_info.firmware_version,
-            device_info.hardware_version,
-        )
-    except DeviceException as ex:
-        _LOGGER.error("Device unavailable or token incorrect: %s", ex)
-        raise PlatformNotReady
+        entities = []
 
-    air_conditioning_companion = XiaomiAirConditioningCompanion(
-        hass,
-        name,
-        device,
-        unique_id,
-        sensor_entity_id,
-        power_sensor_entity_id,
-        min_temp,
-        max_temp,
-    )
-    hass.data[DATA_KEY][host] = air_conditioning_companion
-    async_add_devices([air_conditioning_companion], update_before_add=True)
+        if model in MODELS_MIIO:
+            air_conditioning_companion = XiaomiACPartnerClimate(hass, entry.options, name, unique_id, acpartner)
+            entities.extend(
+                [air_conditioning_companion]
+            )
+            hass.data[DATA_KEY][host] = air_conditioning_companion
+
+        async_add_entities(entities)
+    except AttributeError as ex:
+        _LOGGER.error(ex)
+
 
     async def async_service_handler(service):
         """Map services to methods on XiaomiAirConditioningCompanion."""
@@ -192,10 +185,7 @@ async def async_setup_platform(hass, config, async_add_devices, discovery_info=N
             if not hasattr(device, method["method"]):
                 continue
             await getattr(device, method["method"])(**params)
-            update_tasks.append(device.async_update_ha_state(True))
-
-        if update_tasks:
-            await asyncio.wait(update_tasks)
+            await device.async_update_ha_state(True)
 
     for service in SERVICE_TO_METHOD:
         schema = SERVICE_TO_METHOD[service].get("schema", SERVICE_SCHEMA)
@@ -204,37 +194,24 @@ async def async_setup_platform(hass, config, async_add_devices, discovery_info=N
         )
 
 
-class OperationMode(enum.Enum):
-    Heat = HVAC_MODE_HEAT
-    Cool = HVAC_MODE_COOL
-    Auto = HVAC_MODE_AUTO
-    Dehumidify = HVAC_MODE_DRY
-    Ventilate = HVAC_MODE_FAN_ONLY
-    Off = HVAC_MODE_OFF
+class XiaomiACPartnerClimate(ClimateEntity, RestoreEntity):
+    """Implementation of a Xiaomi Air Conditioning Companion sensor."""
 
-
-class XiaomiAirConditioningCompanion(ClimateEntity):
-    """Representation of a Xiaomi Air Conditioning Companion."""
-
-    def __init__(
-        self,
-        hass,
-        name,
-        device,
-        unique_id,
-        sensor_entity_id,
-        power_sensor_entity_id,
-        min_temp,
-        max_temp,
-    ):
-
-        """Initialize the climate device."""
+    def __init__(self, hass, config, name, unique_id, acpartner):
         self.hass = hass
-        self._name = name
-        self._device = device
+        self._acpartner = acpartner
         self._unique_id = unique_id
-        self._sensor_entity_id = sensor_entity_id
-        self._power_sensor_entity_id = power_sensor_entity_id
+        self._name = name
+        self._model = config.get(CONF_MODEL)
+        self._mac = config.get(CONF_MAC, None)
+        self._slot = None
+        self._delay = DEFAULT_DELAY
+        self._temperature_sensor = config.get(CONF_TEMPERATURE_SENSOR)
+        self._humidity_sensor = config.get(CONF_HUMIDITY_SENSOR)
+        self._power_sensor = config.get(CONF_POWER_SENSOR)
+      #  self._power_sensor_restore_state = config.get(CONF_POWER_SENSOR_RESTORE_STATE)
+        self._power_sensor_restore_state = False
+        self._air_condition_model = None
 
         self._available = False
         self._state = None
@@ -247,110 +224,326 @@ class XiaomiAirConditioningCompanion(ClimateEntity):
             ATTR_LED: None,
         }
 
-        self._max_temp = max_temp
-        self._min_temp = min_temp
-        self._current_temperature = None
-        self._swing_mode = None
+        self._min_temperature = config.get(CONF_MIN_TEMP, 16)
+        self._max_temperature = config.get(CONF_MAX_TEMP, 32)
+        self._precision = TARGET_TEMPERATURE_STEP
+
+        self._operation_modes = [mode.value for mode in OperationMode]
+        self._fan_modes =  [speed.name.lower() for speed in FanSpeed]
+        self._swing_modes = [mode.name.lower() for mode in SwingMode if "Unknown" not in mode.name]
+        self._commands = []
+
+        self._target_temperature = DEFAULT_TARGET_TEMPERATURE
+        self._hvac_mode = HVAC_MODE_OFF
+        self._current_fan_mode = self._fan_modes[0]
+        self._current_swing_mode = None
         self._last_on_operation = None
-        self._hvac_mode = None
-        self._fan_mode = None
-        self._air_condition_model = None
-        self._target_temperature = None
 
-        if sensor_entity_id:
-            async_track_state_change(hass, sensor_entity_id, self._async_sensor_changed)
-            sensor_state = hass.states.get(sensor_entity_id)
-            if sensor_state:
-                self._async_update_temp(sensor_state)
+        self._current_temperature = None
+        self._current_humidity = None
 
-        if power_sensor_entity_id:
-            async_track_state_change(
-                hass, power_sensor_entity_id, self._async_power_sensor_changed
-            )
-            sensor_state = hass.states.get(power_sensor_entity_id)
-            if sensor_state:
-                self._async_update_power_state(sensor_state)
+        self._unit = hass.config.units.temperature_unit
 
-    @callback
-    def _async_update_temp(self, state):
-        """Update thermostat with latest state from sensor."""
-        if state.state is None or state.state in ["unknown", "unavailable"]:
-            return
+        # Supported features
+        self._support_flags = SUPPORT_FLAGS
+        self._support_swing = False
 
-        unit = state.attributes.get(ATTR_UNIT_OF_MEASUREMENT)
+        if self._swing_modes:
+            self._support_flags = self._support_flags | SUPPORT_SWING_MODE
+            self._current_swing_mode = self._swing_modes[0]
+            self._support_swing = True
 
-        try:
-            self._current_temperature = self.hass.config.units.temperature(
-                float(state.state), unit
-            )
-        except ValueError as ex:
-            _LOGGER.error("Unable to update from sensor: %s", ex)
+        self._temp_lock = asyncio.Lock()
+        self._on_by_remote = False
 
-    @callback
-    def _async_update_power_state(self, state):
-        """Update thermostat with latest state from power sensor."""
-        if state.state is None:
-            return
-        if state.state == STATE_ON:
-            await self.async_turn_on()
+        self._attr_unique_id = self._unique_id
+
+    async def async_added_to_hass(self):
+        """Run when entity about to be added."""
+        await super().async_added_to_hass()
+
+        last_state = await self.async_get_last_state()
+
+        if last_state is not None:
+            self._hvac_mode = last_state.state
+            self._current_fan_mode = last_state.attributes['fan_mode']
+            self._current_swing_mode = last_state.attributes.get('swing_mode')
+            self._target_temperature = last_state.attributes['temperature'] if last_state.attributes['temperature'] else DEFAULT_TARGET_TEMPERATURE
+
+            if 'last_on_operation' in last_state.attributes:
+                self._last_on_operation = last_state.attributes['last_on_operation']
+                self._state = self._last_on_operation
+
+        if self._temperature_sensor:
+            async_track_state_change(self.hass, self._temperature_sensor,
+                                        self._async_temp_sensor_changed)
+
+            temp_sensor_state = self.hass.states.get(self._temperature_sensor)
+            if temp_sensor_state and temp_sensor_state.state != STATE_UNKNOWN:
+                self._async_update_temp(temp_sensor_state)
+
+        if self._humidity_sensor:
+            async_track_state_change(self.hass, self._humidity_sensor,
+                                        self._async_humidity_sensor_changed)
+
+            humidity_sensor_state = self.hass.states.get(self._humidity_sensor)
+            if humidity_sensor_state and humidity_sensor_state.state != STATE_UNKNOWN:
+                self._async_update_humidity(humidity_sensor_state)
+
+        if self._power_sensor:
+            async_track_state_change(self.hass, self._power_sensor,
+                                     self._async_power_sensor_changed)
+
+    @property
+    def unique_id(self):
+        """Return a unique ID."""
+        return self._unique_id
+
+    @property
+    def name(self):
+        """Return the name of the climate device."""
+        return self._name
+
+    @property
+    def state(self):
+        """Return the current state."""
+        if self.hvac_mode != HVAC_MODE_OFF:
+            return self.hvac_mode
+        return HVAC_MODE_OFF
+
+    @property
+    def temperature_unit(self):
+        """Return the unit of measurement."""
+        return self._unit
+
+    @property
+    def min_temp(self):
+        """Return the polling state."""
+        return self._min_temperature
+
+    @property
+    def max_temp(self):
+        """Return the polling state."""
+        return self._max_temperature
+
+    @property
+    def target_temperature(self):
+        """Return the temperature we try to reach."""
+        return self._target_temperature
+
+    @property
+    def target_temperature_step(self):
+        """Return the supported step of target temperature."""
+        return self._precision
+
+    @property
+    def hvac_modes(self):
+        """Return the list of available operation modes."""
+        return self._operation_modes
+
+    @property
+    def hvac_mode(self):
+        """Return hvac mode ie. heat, cool."""
+        return self._hvac_mode
+
+    @property
+    def last_on_operation(self):
+        """Return the last non-idle operation ie. heat, cool."""
+        return self._last_on_operation
+
+    @property
+    def fan_modes(self):
+        """Return the list of available fan modes."""
+        return self._fan_modes
+
+    @property
+    def fan_mode(self):
+        """Return the fan setting."""
+        return self._current_fan_mode
+
+    @property
+    def swing_modes(self):
+        """Return the swing modes currently supported for this device."""
+        return self._swing_modes
+
+    @property
+    def swing_mode(self):
+        """Return the current swing mode."""
+        return self._current_swing_mode
+
+    @property
+    def current_temperature(self):
+        """Return the current temperature."""
+        return self._current_temperature
+
+    @property
+    def current_humidity(self):
+        """Return the current humidity."""
+        return self._current_humidity
+
+    @property
+    def supported_features(self):
+        """Return the list of supported features."""
+        return self._support_flags
+
+    @property
+    def extra_state_attributes(self):
+        """Platform specific attributes."""
+        return {
+            'last_on_operation': self._last_on_operation,
+            'data': self._slot,
+        }
+
+    @property
+    def device_info(self):
+        """Return the device info."""
+        info = self._acpartner.info()
+        device_info = {
+            "identifiers": {(DOMAIN, self._unique_id)},
+            "manufacturer": (self._model or "Xiaomi").split(".", 1)[0].capitalize(),
+            "name": self._name,
+            "model": self._model,
+            "sw_version": info.firmware_version,
+            "hw_version": info.hardware_version
+        }
+
+        if self._mac is not None:
+            device_info["connections"] = {(dr.CONNECTION_NETWORK_MAC, self._mac)}
+
+        return device_info
+
+
+    async def _send_configuration(self):
+        if self._air_condition_model is not None:
+            try:
+                await self._try_command(
+                    "Sending new air conditioner configuration failed.",
+                    self._acpartner.send_configuration,
+                    self._air_condition_model,
+                    Power(int(self._state)),
+                    MiioOperationMode[OperationMode(self._hvac_mode).name]
+                        if self._state else MiioOperationMode[OperationMode(self._last_on_operation).name],
+                    self._target_temperature if isinstance(
+                        self._target_temperature, int) else int(self._target_temperature),
+                    FanSpeed[self._current_fan_mode.capitalize()],
+                    SwingMode[self._current_swing_mode.capitalize()],
+                    Led.Off,
+                )
+            except ValueError:
+                _LOGGER.error(
+                    "send configuration with invalid value"
+                )
         else:
-            await self.async_turn_off()
+            _LOGGER.error(
+                "Model number of the air condition unknown. "
+                "Configuration cannot be sent."
+            )
 
-    async def _async_sensor_changed(self, entity_id, old_state, new_state):
-        """Handle temperature changes."""
-        if new_state is None:
+    async def async_set_temperature(self, **kwargs):
+        """Set new target temperatures."""
+        hvac_mode = kwargs.get(ATTR_HVAC_MODE)
+        temperature = kwargs.get(ATTR_TEMPERATURE)
+
+        if temperature is None:
             return
-        self._async_update_temp(new_state)
 
-    async def _async_power_sensor_changed(self, entity_id, old_state, new_state):
-        """Handle power sensor changes."""
-        if new_state is None:
+        if temperature < self._min_temperature or temperature > self._max_temperature:
+            _LOGGER.warning('The temperature value is out of min/max range')
             return
 
-        await self._async_update_power_state(new_state)
+        if self._precision == PRECISION_WHOLE:
+            self._target_temperature = round(temperature)
+        else:
+            self._target_temperature = round(temperature, 1)
+
+        if hvac_mode:
+            await self.async_set_hvac_mode(hvac_mode)
+            return
+
+        if not self._hvac_mode.lower() == HVAC_MODE_OFF:
+            await self._send_configuration()
+
+        self.async_write_ha_state()
+
+    async def async_set_hvac_mode(self, hvac_mode):
+        """Set operation mode."""
+        self._hvac_mode = hvac_mode
+
+        if hvac_mode == OperationMode.Off.value:
+            result = await self._try_command(
+                "Turning the miio device off failed.", self._acpartner.off
+            )
+            if result:
+                self._state = False
+                self._hvac_mode = HVAC_MODE_OFF
+                await self._send_configuration()
+        else:
+            self._state = True
+            await self._send_configuration()
+
+        self.async_write_ha_state()
+
+    async def async_set_fan_mode(self, fan_mode):
+        """Set fan mode."""
+        self._current_fan_mode = fan_mode
+
+        if not self._hvac_mode.lower() == HVAC_MODE_OFF:
+            await self._try_command("Turning the acpartner on failed.", self._acpartner.off)
+
+        self.async_write_ha_state()
+
+    async def async_set_swing_mode(self, swing_mode):
+        """Set swing mode."""
+        self._current_swing_mode = swing_mode
+
+        if not self._hvac_mode.lower() == HVAC_MODE_OFF:
+            await self._try_command("Turning the acpartner on failed.", self._acpartner.on)
+        self.async_write_ha_state()
+
+    async def async_turn_off(self):
+        """Turn off."""
+        self._state = False
+        await self.async_set_hvac_mode(HVAC_MODE_OFF)
+
+    async def async_turn_on(self):
+        """Turn on."""
+        if self._last_on_operation is not None:
+            await self.async_set_hvac_mode(self._last_on_operation)
+        else:
+            await self.async_set_hvac_mode(self._operation_modes[1])
+        self._state = True
 
     async def _try_command(self, mask_error, func, *args, **kwargs):
-        """Call a AC companion command handling error messages."""
-        from miio import DeviceException
-
+        """Call a plug command handling error messages."""
         try:
-            result = await self.hass.async_add_job(partial(func, *args, **kwargs))
+            result = await self.hass.async_add_executor_job(
+                partial(func, *args, **kwargs)
+            )
 
-            _LOGGER.debug("Response received: %s", result)
+            _LOGGER.debug("Response received from climate: %s", result)
 
-            return result == SUCCESS
+            return True if "ok" in result else False
         except DeviceException as exc:
-            _LOGGER.error(mask_error, exc)
-            self._available = False
+            if self._available:
+                _LOGGER.error(mask_error, exc)
+                self._available = False
+
             return False
 
-    async def async_turn_on(self, speed: str = None, **kwargs) -> None:
-        """Turn the miio device on."""
-        result = await self._try_command(
-            "Turning the miio device on failed.", self._device.on
-        )
-
-        if result:
-            self._state = True
-
-    async def async_turn_off(self, **kwargs) -> None:
-        """Turn the miio device off."""
-        result = await self._try_command(
-            "Turning the miio device off failed.", self._device.off
-        )
-
-        if result:
-            self._state = False
-
     async def async_update(self):
-        """Update the state of this climate device."""
-        from miio import DeviceException
-
+        """Fetch state from the device."""
+        state = None
         try:
-            state = await self.hass.async_add_job(self._device.status)
+            state = await self.hass.async_add_executor_job(self._acpartner.status)
             _LOGGER.debug("Got new state: %s", state)
 
-            self._available = True
+        except DeviceException as ex:
+            if self._available:
+                self._available = False
+                _LOGGER.debug("Got exception while fetching the state: %s", ex)
+
+        self._available = True
+        if state:
             self._state_attrs.update(
                 {
                     ATTR_AIR_CONDITION_MODEL: state.air_condition_model.hex(),
@@ -362,193 +555,82 @@ class XiaomiAirConditioningCompanion(ClimateEntity):
                     ATTR_LED: state.led,
                 }
             )
-            self._last_on_operation = OperationMode[state.mode.name].value
-            if state.power == "off":
-                self._hvac_mode = HVAC_MODE_OFF
-                self._state = False
-            else:
-                self._hvac_mode = self._last_on_operation
-                self._state = True
-            self._target_temperature = state.target_temperature
-            self._fan_mode = state.fan_speed
-            self._swing_mode = state.swing_mode
-            if self._air_condition_model is None:
-                self._air_condition_model = state.air_condition_model.hex()
-
-        except DeviceException as ex:
-            self._available = False
-            _LOGGER.error("Got exception while fetching the state: %s", ex)
-
-    @property
-    def supported_features(self):
-        """Return the list of supported features."""
-        return SUPPORT_FLAGS
-
-    @property
-    def min_temp(self):
-        """Return the minimum temperature."""
-        return self._min_temp
-
-    @property
-    def max_temp(self):
-        """Return the maximum temperature."""
-        return self._max_temp
-
-    @property
-    def target_temperature_step(self):
-        """Return the target temperature step."""
-        return TARGET_TEMPERATURE_STEP
-
-    @property
-    def should_poll(self):
-        """Return the polling state."""
-        return True
-
-    @property
-    def unique_id(self):
-        """Return an unique ID."""
-        return self._unique_id
-
-    @property
-    def name(self):
-        """Return the name of the climate device."""
-        return self._name
-
-    @property
-    def available(self):
-        """Return true when state is known."""
-        return self._available
-
-    @property
-    def extra_state_attributes(self):
-        """Return the extra state attributes of the device."""
-        return self._state_attrs
-
-    @property
-    def temperature_unit(self):
-        """Return the unit of measurement."""
-        return TEMP_CELSIUS
-
-    @property
-    def current_temperature(self):
-        """Return the current temperature."""
-        return self._current_temperature
-
-    @property
-    def target_temperature(self):
-        """Return the temperature we try to reach."""
-        return self._target_temperature
-
-    @property
-    def hvac_mode(self):
-        """Return new hvac mode ie. heat, cool, fan only."""
-        return self._hvac_mode
-
-    @property
-    def last_on_operation(self):
-        """Return the last operation when the AC is on (ie heat, cool, fan only)"""
-        return self._last_on_operation
-
-    @property
-    def hvac_modes(self):
-        """Return the list of available hvac modes."""
-        return [mode.value for mode in OperationMode]
-
-    @property
-    def fan_mode(self):
-        """Return the current fan mode."""
-        return self._fan_mode.name.lower()
-
-    @property
-    def fan_modes(self):
-        """Return the list of available fan modes."""
-        from miio.airconditioningcompanion import FanSpeed
-
-        return [speed.name.lower() for speed in FanSpeed]
-
-    async def async_set_temperature(self, **kwargs):
-        """Set target temperature."""
-        if kwargs.get(ATTR_TEMPERATURE) is not None:
-            self._target_temperature = kwargs.get(ATTR_TEMPERATURE)
-        if kwargs.get(ATTR_HVAC_MODE) is not None:
-            self._hvac_mode = OperationMode(kwargs.get(ATTR_HVAC_MODE))
-
-        await self._send_configuration()
-
-    async def async_set_swing_mode(self, swing_mode):
-        """Set the swing mode."""
-        from miio.airconditioningcompanion import SwingMode
-
-        self._swing_mode = SwingMode[swing_mode.title()]
-        await self._send_configuration()
-
-    async def async_set_fan_mode(self, fan_mode):
-        """Set the fan mode."""
-        from miio.airconditioningcompanion import FanSpeed
-
-        self._fan_mode = FanSpeed[fan_mode.title()]
-        await self._send_configuration()
-
-    async def async_set_hvac_mode(self, hvac_mode):
-        """Set new target hvac mode."""
-        if hvac_mode == OperationMode.Off.value:
-            result = await self._try_command(
-                "Turning the miio device off failed.", self._device.off
-            )
-            if result:
-                self._state = False
-                self._hvac_mode = HVAC_MODE_OFF
-                await self._send_configuration()
+        self._last_on_operation = OperationMode[state.mode.name].value
+        if state and state.power == "off":
+            self._hvac_mode = HVAC_MODE_OFF
+            self._state = False
         else:
-            self._hvac_mode = OperationMode(hvac_mode).value
+            self._hvac_mode = self._last_on_operation
             self._state = True
-            await self._send_configuration()
+        if self._air_condition_model is None and state:
+            self._air_condition_model = state.air_condition_model.hex()
 
-    @property
-    def swing_mode(self):
-        """Return the current swing setting."""
-        return self._swing_mode.name.lower()
 
-    @property
-    def swing_modes(self):
-        """List of available swing modes."""
-        from miio.airconditioningcompanion import SwingMode
+    async def _async_temp_sensor_changed(self, entity_id, old_state, new_state):
+        """Handle temperature sensor changes."""
+        if new_state is None:
+            return
 
-        return [mode.name.lower() for mode in SwingMode]
+        self._async_update_temp(new_state)
+        self.async_write_ha_state()
 
-    async def _send_configuration(self):
-        from miio.airconditioningcompanion import Led
-        from miio.airconditioningcompanion import OperationMode as MiioOperationMode
-        from miio.airconditioningcompanion import Power
+    async def _async_humidity_sensor_changed(self, entity_id, old_state, new_state):
+        """Handle humidity sensor changes."""
+        if new_state is None:
+            return
 
-        if self._air_condition_model is not None:
-            await self._try_command(
-                "Sending new air conditioner configuration failed.",
-                self._device.send_configuration,
-                self._air_condition_model,
-                Power(int(self._state)),
-                MiioOperationMode[OperationMode(self._hvac_mode).name]
-                if self._state
-                else MiioOperationMode[OperationMode(self._last_on_operation).name],
-                int(self._target_temperature),
-                self._fan_mode,
-                self._swing_mode,
-                Led.Off,
-            )
-        else:
-            _LOGGER.error(
-                "Model number of the air condition unknown. "
-                "Configuration cannot be sent."
-            )
+        self._async_update_humidity(new_state)
+        self.async_write_ha_state()
+
+    async def _async_power_sensor_changed(self, entity_id, old_state, new_state):
+        """Handle power sensor changes."""
+        if new_state is None:
+            return
+
+        if old_state is not None and new_state.state == old_state.state:
+            return
+
+        if new_state.state == STATE_ON and self._hvac_mode == HVAC_MODE_OFF:
+            self._on_by_remote = True
+            if self._power_sensor_restore_state == True and self._last_on_operation is not None:
+                self._hvac_mode = self._last_on_operation
+            else:
+                self._hvac_mode = STATE_ON
+
+            self.async_write_ha_state()
+
+        if new_state.state == STATE_OFF:
+            self._on_by_remote = False
+            if self._hvac_mode != HVAC_MODE_OFF:
+                self._hvac_mode = HVAC_MODE_OFF
+            self.async_write_ha_state()
+
+    @callback
+    def _async_update_temp(self, state):
+        """Update thermostat with latest state from temperature sensor."""
+        try:
+            if state.state != STATE_UNKNOWN and state.state != STATE_UNAVAILABLE:
+                self._current_temperature = float(state.state)
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from temperature sensor: %s", ex)
+
+    @callback
+    def _async_update_humidity(self, state):
+        """Update thermostat with latest state from humidity sensor."""
+        try:
+            if state.state != STATE_UNKNOWN and state.state != STATE_UNAVAILABLE:
+                self._current_humidity = float(state.state)
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from humidity sensor: %s", ex)
 
     async def async_learn_command(self, slot, timeout):
         """Learn a infrared command."""
-        await self.hass.async_add_job(self._device.learn, slot)
+        await self.hass.async_add_job(self._acpartner.learn, slot)
 
         _LOGGER.info("Press the key you want Home Assistant to learn")
         start_time = utcnow()
         while (utcnow() - start_time) < timedelta(seconds=timeout):
-            message = await self.hass.async_add_job(self._device.learn_result)
+            message = await self.hass.async_add_job(self._acpartner.learn_result)
             # FIXME: Improve python-miio here?
             message = message[0]
             _LOGGER.debug("Message received from device: '%s'", message)
@@ -558,12 +640,12 @@ class XiaomiAirConditioningCompanion(ClimateEntity):
                 self.hass.components.persistent_notification.async_create(
                     log_msg, title="Xiaomi Miio Remote"
                 )
-                await self.hass.async_add_job(self._device.learn_stop, slot)
+                await self.hass.async_add_job(self._acpartner.learn_stop, slot)
                 return
 
             await asyncio.sleep(1)
 
-        await self.hass.async_add_job(self._device.learn_stop, slot)
+        await self.hass.async_add_job(self._acpartner.learn_stop, slot)
         _LOGGER.error("Timeout. No infrared command captured")
         self.hass.components.persistent_notification.async_create(
             "Timeout. No infrared command captured", title="Xiaomi Miio Remote"
@@ -574,6 +656,11 @@ class XiaomiAirConditioningCompanion(ClimateEntity):
         repeat = kwargs[ATTR_NUM_REPEATS]
         delay = kwargs[ATTR_DELAY_SECS]
         first_command = True
+
+        if not command:
+            _LOGGER.error("No IR command.")
+            return
+
         for _ in range(repeat):
             if not first_command:
                 time.sleep(delay)
@@ -581,7 +668,7 @@ class XiaomiAirConditioningCompanion(ClimateEntity):
             if command.startswith("01"):
                 await self._try_command(
                     "Sending new air conditioner configuration failed.",
-                    self._device.send_command,
+                    self._acpartner.send_command,
                     command,
                 )
             elif command.startswith("FE"):
@@ -589,7 +676,7 @@ class XiaomiAirConditioningCompanion(ClimateEntity):
                     # Learned infrared commands has the prefix 'FE'
                     await self._try_command(
                         "Sending custom infrared command failed.",
-                        self._device.send_ir_code,
+                        self._acpartner.send_ir_code,
                         self._air_condition_model,
                         command,
                     )
