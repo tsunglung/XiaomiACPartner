@@ -17,7 +17,7 @@ from homeassistant.helpers.event import async_track_state_change
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util.dt import utcnow
-from homeassistant.components.climate import ClimateEntity
+from homeassistant.components.climate import ClimateEntity, ClimateEntityFeature
 from homeassistant.components.climate.const import (
     ATTR_HVAC_MODE,
     HVAC_MODE_AUTO,
@@ -25,10 +25,7 @@ from homeassistant.components.climate.const import (
     HVAC_MODE_DRY,
     HVAC_MODE_FAN_ONLY,
     HVAC_MODE_HEAT,
-    HVAC_MODE_OFF,
-    SUPPORT_FAN_MODE,
-    SUPPORT_SWING_MODE,
-    SUPPORT_TARGET_TEMPERATURE
+    HVAC_MODE_OFF
 )
 from homeassistant.components.remote import (
     ATTR_DELAY_SECS,
@@ -84,9 +81,9 @@ from .const import (
 )
 
 SUPPORT_FLAGS = (
-    SUPPORT_TARGET_TEMPERATURE |
-    SUPPORT_FAN_MODE |
-    SUPPORT_SWING_MODE
+    ClimateEntityFeature.TARGET_TEMPERATURE |
+    ClimateEntityFeature.FAN_MODE |
+    ClimateEntityFeature.SWING_MODE
 )
 
 
@@ -185,7 +182,12 @@ async def async_setup_entry(
             if not hasattr(device, method["method"]):
                 continue
             await getattr(device, method["method"])(**params)
+            # update_tasks.append(device.async_update_ha_state(True))
             await device.async_update_ha_state(True)
+
+        # if update_tasks:
+            # await asyncio.wait(update_tasks)
+
 
     for service in SERVICE_TO_METHOD:
         schema = SERVICE_TO_METHOD[service].get("schema", SERVICE_SCHEMA)
@@ -249,7 +251,7 @@ class XiaomiACPartnerClimate(ClimateEntity, RestoreEntity):
         self._support_swing = False
 
         if self._swing_modes:
-            self._support_flags = self._support_flags | SUPPORT_SWING_MODE
+            self._support_flags = self._support_flags | ClimateEntityFeature.SWING_MODE
             self._current_swing_mode = self._swing_modes[0]
             self._support_swing = True
 
@@ -291,8 +293,9 @@ class XiaomiACPartnerClimate(ClimateEntity, RestoreEntity):
                 self._async_update_humidity(humidity_sensor_state)
 
         if self._power_sensor:
-            async_track_state_change(self.hass, self._power_sensor,
-                                     self._async_power_sensor_changed)
+            async_track_state_change(
+                self.hass, self._power_sensor,
+                self._async_power_sensor_changed)
 
     @property
     def unique_id(self):
@@ -414,6 +417,15 @@ class XiaomiACPartnerClimate(ClimateEntity, RestoreEntity):
 
 
     async def _send_configuration(self):
+        _LOGGER.error("_send_configuration {} {} {} {} {}".format(
+            Power(int(self._state)),
+            MiioOperationMode[OperationMode(self._hvac_mode).name]
+                if self._state else MiioOperationMode[OperationMode(self._last_on_operation).name],
+            self._target_temperature if isinstance(
+                self._target_temperature, int) else int(self._target_temperature),
+            FanSpeed[self._current_fan_mode.capitalize()],
+            SwingMode[self._current_swing_mode.capitalize()]
+        ))
         if self._air_condition_model is not None:
             try:
                 await self._try_command(
@@ -544,9 +556,12 @@ class XiaomiACPartnerClimate(ClimateEntity, RestoreEntity):
 
         self._available = True
         if state:
+            model = "Unspecified"
+            if state.air_condition_model:
+                model = state.air_condition_model.hex()
             self._state_attrs.update(
                 {
-                    ATTR_AIR_CONDITION_MODEL: state.air_condition_model.hex(),
+                    ATTR_AIR_CONDITION_MODEL: model,
                     ATTR_LOAD_POWER: state.load_power,
                     ATTR_TEMPERATURE: state.target_temperature,
                     ATTR_SWING_MODE: state.swing_mode.name.lower(),
@@ -555,7 +570,10 @@ class XiaomiACPartnerClimate(ClimateEntity, RestoreEntity):
                     ATTR_LED: state.led,
                 }
             )
-        self._last_on_operation = OperationMode[state.mode.name].value
+        if state.mode:
+            self._last_on_operation = OperationMode[state.mode.name].value
+        else:
+            self._last_on_operation = "off"
         if state and state.power == "off":
             self._hvac_mode = HVAC_MODE_OFF
             self._state = False
@@ -656,6 +674,7 @@ class XiaomiACPartnerClimate(ClimateEntity, RestoreEntity):
         repeat = kwargs[ATTR_NUM_REPEATS]
         delay = kwargs[ATTR_DELAY_SECS]
         first_command = True
+        _LOGGER.error(command)
 
         if not command:
             _LOGGER.error("No IR command.")
